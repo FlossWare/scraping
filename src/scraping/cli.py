@@ -42,6 +42,8 @@ def main(argv=None) -> int:
         parser.error("depth/max-pages/max-file-size must be positive where applicable; timeout > 0; rate-limit >= 0")
     if args.sitemap_depth < 0 or args.sitemap_max_urls < 1 or args.sitemap_max_total_size < 1:
         parser.error("sitemap limits are invalid")
+    if not args.sources and not args.uris and not args.sitemap:
+        parser.error("at least one source, --uris file, or --sitemap is required")
 
     corpus = LocalCorpus(args.output)
     targets: list[tuple[str, str]] = []
