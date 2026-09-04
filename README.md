@@ -56,7 +56,7 @@ Raw acquisition artifacts are preserved and never modified by downstream process
 - private, loopback, link-local, multicast, reserved, and unspecified remote addresses are blocked by default
 - redirects are followed only to allowed HTTP(S)/FTP targets; redirects to `file://` are rejected
 
-Override these with `--depth`, `--max-pages`, `--scope`, `--rate-limit`, `--max-file-size`, `--timeout`, `--allow-private`, and `--no-robots`.
+Override these with `--depth`, `--max-pages`, `--scope`, `--rate-limit`, `--max-file-size`, `--timeout`, `--allow-private`, `--no-robots`, `--sitemap-depth`, `--sitemap-max-urls`, and `--sitemap-max-total-size`.
 
 `--allow-private` is intended for trusted environments such as internal test networks. Do not expose it as an unrestricted public-fetch service.
 
