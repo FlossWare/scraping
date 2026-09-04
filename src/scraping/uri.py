@@ -16,5 +16,7 @@ def normalize_uri(value: str) -> str:
     if scheme not in SUPPORTED_SCHEMES:
         raise ValueError(f"Unsupported URI scheme: {scheme}")
     if scheme == "file":
+        if parsed.netloc not in {"", "localhost"}:
+            raise ValueError("remote file hosts are not supported")
         return Path(parsed.path).expanduser().resolve().as_uri()
     return urlunparse((scheme, parsed.netloc, parsed.path or "/", parsed.params, parsed.query, ""))
