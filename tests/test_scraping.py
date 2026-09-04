@@ -1,8 +1,9 @@
 import json
 
 import pytest
+from urllib.request import Request
 
-from scraping.acquisition.corpus import LocalCorpus, fetch_uri
+from scraping.acquisition.corpus import LocalCorpus, _SafeRedirectHandler, fetch_uri, validate_remote_uri
 from scraping.cli import main
 from scraping.discovery.filesystem import filesystem_uris
 from scraping.discovery.sitemap import sitemap_urls
@@ -17,6 +18,11 @@ def test_package_import_smoke():
 
 def test_normalize_path_to_file_uri(tmp_path):
     assert normalize_uri(str(tmp_path / "x.pdf")).startswith("file:///")
+
+
+def test_normalize_rejects_remote_file_host():
+    with pytest.raises(ValueError, match="remote file hosts"):
+        normalize_uri("file://server/share/file.txt")
 
 
 def test_extract_links_normalizes_fragments():
@@ -48,6 +54,11 @@ def test_fetch_uri_rejects_unsupported_scheme():
         fetch_uri("gopher://example.org/")
 
 
+def test_validate_remote_uri_blocks_loopback():
+    with pytest.raises(ValueError, match="private or non-public"):
+        validate_remote_uri("http://127.0.0.1/")
+
+
 def test_fetch_uri_enforces_size_limit(monkeypatch):
     class Headers:
         def get(self, name):
@@ -74,6 +85,37 @@ def test_fetch_uri_enforces_size_limit(monkeypatch):
     )
     with pytest.raises(ValueError, match="max size"):
         fetch_uri("https://example.org/large", max_size=10, allow_private=True)
+
+
+def test_ftp_uses_shared_fetch_controls(monkeypatch):
+    class Headers:
+        def get(self, name):
+            return None
+        def get_content_type(self):
+            return "text/plain"
+
+    class Response:
+        headers = Headers()
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, size=-1):
+            return b"ftp-data" if size >= 9 else b"ftp-data"[:size]
+
+    monkeypatch.setattr(
+        "scraping.acquisition.corpus.build_opener",
+        lambda handler: type("O", (), {"open": lambda self, request, timeout: Response()})(),
+    )
+    data, media_type = fetch_uri("ftp://127.0.0.1/file.txt", max_size=100, allow_private=True)
+    assert data == b"ftp-data"
+    assert media_type == "text/plain"
+
+
+def test_redirect_handler_rejects_file_redirect():
+    handler = _SafeRedirectHandler(allow_private=True)
+    with pytest.raises(ValueError, match="file://"):
+        handler.redirect_request(Request("https://example.org/"), None, 302, "Found", {}, "file:///etc/passwd")
 
 
 def test_robots_missing_allows(monkeypatch):
