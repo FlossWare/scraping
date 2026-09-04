@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from scraping.acquisition.corpus import LocalCorpus
 from scraping.discovery.filesystem import filesystem_uris
@@ -26,7 +25,7 @@ def test_corpus_stores_raw_and_manifest(tmp_path):
     corpus = LocalCorpus(tmp_path / "corpus")
     record = corpus.store("file:///tmp/a.txt", b"hello", "text/plain", "filesystem")
     assert record is not None
-    assert Path(record.raw_path).exists()
+    assert (corpus.root / record.raw_path).exists()
     rows = corpus.manifest.read_text(encoding="utf-8").splitlines()
     assert json.loads(rows[0])["content_hash"] == record.content_hash
     assert (tmp_path / "corpus" / "extracted").is_dir()
