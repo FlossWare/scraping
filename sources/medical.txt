@@ -1,0 +1,7 @@
+# Medical and biomedical sources
+https://pubmed.ncbi.nlm.nih.gov/
+https://www.ncbi.nlm.nih.gov/books/
+https://www.cdc.gov/
+https://www.fda.gov/
+https://www.who.int/
+https://www.nih.gov/
