@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import socket
 from ipaddress import ip_address
 from pathlib import Path
@@ -17,11 +18,11 @@ def _blocked_address(hostname: str) -> bool:
         addresses = {info[4][0] for info in socket.getaddrinfo(hostname, None)}
     except socket.gaierror as exc:
         raise OSError(f"unable to resolve remote host: {hostname}") from exc
-    for address in addresses:
-        ip = ip_address(address)
-        if any((ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_multicast, ip.is_unspecified, ip.is_reserved)):
-            return True
-    return False
+    return any(
+        any((ip_address(address).is_private, ip_address(address).is_loopback, ip_address(address).is_link_local,
+             ip_address(address).is_multicast, ip_address(address).is_unspecified, ip_address(address).is_reserved))
+        for address in addresses
+    )
 
 
 def validate_remote_uri(uri: str, *, allow_private: bool = False) -> None:
@@ -40,8 +41,7 @@ class _SafeRedirectHandler(HTTPRedirectHandler):
         self.allow_private = allow_private
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        parsed = urlparse(newurl)
-        if parsed.scheme == "file":
+        if urlparse(newurl).scheme == "file":
             raise ValueError("refusing redirect to file://")
         validate_remote_uri(newurl, allow_private=self.allow_private)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -62,30 +62,28 @@ class LocalCorpus:
     def store(self, uri: str, data: bytes, media_type: str, discovered_by: str) -> AcquiredResource:
         digest = hashlib.sha256(data).hexdigest()
         existing = self.root / "raw" / digest[:2] / digest[2:4]
-        suffix = self._suffix(uri, media_type)
-        raw_path = existing / f"{digest}{suffix}"
+        raw_path = existing / f"{digest}{self._suffix(uri, media_type)}"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         if not raw_path.exists():
-            tmp = raw_path.with_name(raw_path.name + ".tmp")
+            tmp = raw_path.with_name(raw_path.name + f".{os.getpid()}.tmp")
             tmp.write_bytes(data)
             tmp.replace(raw_path)
         record = AcquiredResource(
-            uri,
-            media_type,
-            digest,
-            str(raw_path.relative_to(self.root)),
-            len(data),
-            AcquiredResource.now(),
-            discovered_by,
+            uri, media_type, digest, str(raw_path.relative_to(self.root)), len(data),
+            AcquiredResource.now(), discovered_by,
         )
-        with self.manifest.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record.__dict__, sort_keys=True) + "\n")
+        line = (json.dumps(record.__dict__, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(self.manifest, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         return record
 
     @staticmethod
     def _suffix(uri: str, media_type: str) -> str:
-        path = unquote(urlparse(uri).path)
-        suffix = Path(path).suffix.lower()
+        suffix = Path(unquote(urlparse(uri).path)).suffix.lower()
         if suffix and len(suffix) <= 10:
             return suffix
         return {"text/html": ".html", "application/pdf": ".pdf", "text/plain": ".txt"}.get(media_type, ".bin")
@@ -95,6 +93,10 @@ def read_file_uri(uri: str, *, max_size: int) -> tuple[bytes, str]:
     parsed = urlparse(uri)
     if parsed.scheme != "file":
         raise ValueError("not a file URI")
+    if parsed.netloc not in {"", "localhost"}:
+        raise ValueError("remote file hosts are not supported")
+    if max_size < 1:
+        raise ValueError("max_size must be positive")
     path = Path(unquote(parsed.path)).resolve()
     size = path.stat().st_size
     if size > max_size:
@@ -110,6 +112,8 @@ def fetch_uri(
     user_agent: str = DEFAULT_USER_AGENT,
     allow_private: bool = False,
 ) -> tuple[bytes, str]:
+    if timeout <= 0 or max_size < 1:
+        raise ValueError("timeout must be positive and max_size must be positive")
     parsed = urlparse(uri)
     if parsed.scheme == "file":
         return read_file_uri(uri, max_size=max_size)
@@ -120,11 +124,11 @@ def fetch_uri(
         length = response.headers.get("Content-Length")
         if length:
             try:
-                if int(length) > max_size:
-                    raise ValueError("resource exceeds configured max size")
+                length_value = int(length)
             except ValueError as exc:
-                if str(exc) == "resource exceeds configured max size":
-                    raise
+                raise ValueError("invalid Content-Length") from exc
+            if length_value > max_size:
+                raise ValueError("resource exceeds configured max size")
         data = _read_limited(response, max_size)
         return data, response.headers.get_content_type() or "application/octet-stream"
 
