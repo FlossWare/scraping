@@ -23,6 +23,8 @@ def extract_links(html: bytes, base_uri: str) -> list[str]:
     parser.feed(html.decode("utf-8", errors="replace"))
     result = []
     for link in parser.links:
+        if link.startswith("#"):
+            continue
         absolute, _ = urldefrag(urljoin(base_uri, link))
         if urlparse(absolute).scheme in {"http", "https"}:
             result.append(absolute)
@@ -59,7 +61,6 @@ class RobotsPolicy:
                 parser.parse(body.decode("utf-8", errors="replace").splitlines())
                 self._cache[origin] = parser
             except (OSError, ValueError):
-                # Missing, inaccessible, or oversized robots.txt is not an explicit disallow.
                 self._cache[origin] = None
         parser = self._cache[origin]
         return True if parser is None else parser.can_fetch(self.user_agent, uri)
