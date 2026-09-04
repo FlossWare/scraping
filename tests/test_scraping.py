@@ -63,19 +63,15 @@ def test_fetch_uri_enforces_size_limit(monkeypatch):
     class Headers:
         def get(self, name):
             return None
-
         def get_content_type(self):
             return "text/plain"
 
     class Response:
         headers = Headers()
-
         def __enter__(self):
             return self
-
         def __exit__(self, *args):
             return False
-
         def read(self, size=-1):
             return b"x" * size
 
@@ -96,12 +92,17 @@ def test_ftp_uses_shared_fetch_controls(monkeypatch):
 
     class Response:
         headers = Headers()
+        def __init__(self):
+            self.done = False
         def __enter__(self):
             return self
         def __exit__(self, *args):
             return False
         def read(self, size=-1):
-            return b"ftp-data" if size >= 9 else b"ftp-data"[:size]
+            if self.done:
+                return b""
+            self.done = True
+            return b"ftp-data"
 
     monkeypatch.setattr(
         "scraping.acquisition.corpus.build_opener",
