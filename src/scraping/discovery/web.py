@@ -41,9 +41,12 @@ def allowed_by_host(uri: str, root: str, scope: str = "host") -> bool:
 
 
 class RobotsPolicy:
-    def __init__(self, user_agent: str = DEFAULT_USER_AGENT, *, allow_private: bool = False):
+    def __init__(self, user_agent: str = DEFAULT_USER_AGENT, *, allow_private: bool = False,
+                 timeout: float = 30.0, max_size: int = DEFAULT_MAX_SIZE):
         self.user_agent = user_agent
         self.allow_private = allow_private
+        self.timeout = timeout
+        self.max_size = max_size
         self._cache: dict[str, object] = {}
 
     def allowed(self, uri: str) -> bool:
@@ -52,7 +55,7 @@ class RobotsPolicy:
         if origin not in self._cache:
             try:
                 body, _ = fetch_uri(
-                    f"{origin}/robots.txt", timeout=10.0, max_size=1_000_000,
+                    f"{origin}/robots.txt", timeout=self.timeout, max_size=min(self.max_size, 1_000_000),
                     user_agent=self.user_agent, allow_private=self.allow_private,
                 )
                 from urllib.robotparser import RobotFileParser
@@ -81,14 +84,15 @@ def discover_links(
     """Discover URI identities by bounded traversal of HTML pages.
 
     Page bodies are transient traversal inputs. Durable acquisition is performed
-    separately by ``fetch_uri`` and ``LocalCorpus``.
+    separately by ``fetch_uri`` and ``LocalCorpus``. Link discovery therefore
+    reads each HTML page once for traversal and acquisition may read it again.
     """
     if depth < 0 or max_pages < 1 or rate_limit < 0 or timeout <= 0 or max_size < 1:
         raise ValueError("invalid discovery limits")
     queue: list[tuple[str, int]] = [(urldefrag(start)[0], 0)]
     seen: set[str] = set()
     discovered: list[str] = []
-    robots = RobotsPolicy(allow_private=allow_private) if respect_robots else None
+    robots = RobotsPolicy(allow_private=allow_private, timeout=timeout, max_size=max_size) if respect_robots else None
     last_request = 0.0
     while queue and len(discovered) < max_pages:
         uri, level = queue.pop(0)
@@ -114,6 +118,13 @@ def discover_links(
     return discovered
 
 
-# Compatibility alias for callers that used the original name.
-def crawl(start: str, *, depth: int, max_pages: int, rate_limit: float, scope: str, respect_robots: bool) -> list[str]:
-    return discover_links(start, depth=depth, max_pages=max_pages, rate_limit=rate_limit, scope=scope, respect_robots=respect_robots)
+def crawl(
+    start: str, *, depth: int = 2, max_pages: int = 1000, rate_limit: float = 0.5,
+    scope: str = "host", respect_robots: bool = True, timeout: float = 30.0,
+    max_size: int = DEFAULT_MAX_SIZE, allow_private: bool = False,
+) -> list[str]:
+    """Compatibility alias retaining the full discovery security/limit contract."""
+    return discover_links(
+        start, depth=depth, max_pages=max_pages, rate_limit=rate_limit, scope=scope,
+        respect_robots=respect_robots, timeout=timeout, max_size=max_size, allow_private=allow_private,
+    )
