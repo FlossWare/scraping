@@ -1,8 +1,9 @@
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urldefrag, urlparse
-from urllib.robotparser import RobotFileParser
-from urllib.request import Request, urlopen
 import time
+from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.request import Request, urlopen
+
+from ..acquisition.corpus import DEFAULT_MAX_SIZE, DEFAULT_USER_AGENT, fetch_uri
 
 
 class LinkExtractor(HTMLParser):
@@ -39,55 +40,79 @@ def allowed_by_host(uri: str, root: str, scope: str = "host") -> bool:
 
 
 class RobotsPolicy:
-    def __init__(self, user_agent: str = "FlossWare-scraping/0.1"):
+    def __init__(self, user_agent: str = DEFAULT_USER_AGENT):
         self.user_agent = user_agent
-        self._cache: dict[str, RobotFileParser] = {}
+        self._cache: dict[str, object] = {}
 
     def allowed(self, uri: str) -> bool:
         parsed = urlparse(uri)
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        parser = self._cache.get(origin)
-        if parser is None:
-            parser = RobotFileParser(f"{origin}/robots.txt")
+        if origin not in self._cache:
             try:
-                parser.read()
+                request = Request(f"{origin}/robots.txt", headers={"User-Agent": self.user_agent})
+                with urlopen(request, timeout=10) as response:
+                    body = response.read(1_000_001)
+                    if len(body) > 1_000_000:
+                        self._cache[origin] = None
+                        return True
+                from urllib.robotparser import RobotFileParser
+                parser = RobotFileParser()
+                parser.set_url(f"{origin}/robots.txt")
+                parser.parse(body.decode("utf-8", errors="replace").splitlines())
+                self._cache[origin] = parser
             except OSError:
-                return False
-            self._cache[origin] = parser
-        return parser.can_fetch(self.user_agent, uri)
+                # robots.txt being unavailable is not an explicit disallow rule.
+                self._cache[origin] = None
+        parser = self._cache[origin]
+        return True if parser is None else parser.can_fetch(self.user_agent, uri)
 
 
-def fetch(uri: str, *, timeout: float = 30.0, user_agent: str = "FlossWare-scraping/0.1") -> tuple[bytes, str]:
-    request = Request(uri, headers={"User-Agent": user_agent, "Accept": "*/*"})
-    with urlopen(request, timeout=timeout) as response:
-        data = response.read()
-        media_type = response.headers.get_content_type() or "application/octet-stream"
-        return data, media_type
+def discover_links(
+    start: str,
+    *,
+    depth: int = 2,
+    max_pages: int = 1000,
+    rate_limit: float = 0.5,
+    scope: str = "host",
+    respect_robots: bool = True,
+    timeout: float = 30.0,
+    max_size: int = DEFAULT_MAX_SIZE,
+    allow_private: bool = False,
+) -> list[str]:
+    """Discover URI identities by traversing HTML pages.
 
-
-def crawl(start: str, *, depth: int, max_pages: int, rate_limit: float, scope: str, respect_robots: bool) -> list[tuple[str, bytes, str, str]]:
-    queue: list[tuple[str, int]] = [(start, 0)]
+    Page bodies are fetched only transiently to inspect links. Durable acquisition
+    is performed separately by ``fetch_uri``/``LocalCorpus``.
+    """
+    if depth < 0 or max_pages < 1:
+        raise ValueError("depth must be >= 0 and max_pages must be >= 1")
+    queue: list[tuple[str, int]] = [(urldefrag(start)[0], 0)]
     seen: set[str] = set()
-    results = []
-    robots = RobotsPolicy()
-    while queue and len(results) < max_pages:
+    discovered: list[str] = []
+    robots = RobotsPolicy() if respect_robots else None
+    while queue and len(discovered) < max_pages:
         uri, level = queue.pop(0)
         if uri in seen or level > depth:
             continue
         seen.add(uri)
         if not allowed_by_host(uri, start, scope):
             continue
-        if respect_robots and not robots.allowed(uri):
+        if robots and not robots.allowed(uri):
             continue
-        if results and rate_limit > 0:
+        if discovered and rate_limit > 0:
             time.sleep(rate_limit)
         try:
-            data, media_type = fetch(uri)
+            data, media_type = fetch_uri(uri, timeout=timeout, max_size=max_size, allow_private=allow_private)
         except (OSError, ValueError):
             continue
-        results.append((uri, data, media_type, "crawl"))
+        discovered.append(uri)
         if media_type == "text/html" and level < depth:
             for link in extract_links(data, uri):
-                if link not in seen:
+                if link not in seen and allowed_by_host(link, start, scope):
                     queue.append((link, level + 1))
-    return results
+    return discovered
+
+
+# Compatibility alias for callers that used the original name.
+def crawl(start: str, *, depth: int, max_pages: int, rate_limit: float, scope: str, respect_robots: bool) -> list[str]:
+    return discover_links(start, depth=depth, max_pages=max_pages, rate_limit=rate_limit, scope=scope, respect_robots=respect_robots)
