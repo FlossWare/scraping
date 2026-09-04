@@ -52,13 +52,17 @@ Raw acquisition artifacts are preserved and never modified by downstream process
 - rate limit: `0.5` seconds between requests
 - maximum resource size: `50 MB`
 - timeout: `30` seconds
+- DNS resolution timeout: `5` seconds
 - URL fragments are removed for identity/discovery
 - private, loopback, link-local, multicast, reserved, and unspecified remote addresses are blocked by default
 - redirects are followed only to allowed HTTP(S)/FTP targets; redirects to `file://` are rejected
+- credentials embedded in remote URLs are rejected
 
 Override these with `--depth`, `--max-pages`, `--scope`, `--rate-limit`, `--max-file-size`, `--timeout`, `--allow-private`, `--no-robots`, `--sitemap-depth`, `--sitemap-max-urls`, and `--sitemap-max-total-size`.
 
 `--allow-private` is intended for trusted environments such as internal test networks. Do not expose it as an unrestricted public-fetch service.
+
+DNS/IP validation is performed immediately before each remote request and redirect. This blocks ordinary SSRF attempts and bounds resolver hangs. A DNS-rebinding race between validation and connection remains dependent on the operating system resolver/network stack and is considered outside the local CLI threat model.
 
 ## URI catalogs
 
@@ -94,7 +98,7 @@ Acquisition
      Local corpus
 ```
 
-Link traversal may perform bounded transient HTTP reads to discover additional links. Those bytes are not persisted as acquisition records until the acquisition stage consumes the discovered URI set.
+Link traversal performs bounded transient HTTP reads to discover additional links. Those bytes are not persisted as acquisition records until the acquisition stage consumes the discovered URI set. This intentionally means a page reached by link traversal may be fetched twice in a run: once for discovery and once for durable acquisition. The duplication keeps the capability boundary clean; a transient same-run cache can be added later without changing the public contract.
 
 Parsing, extraction, normalization, chunking, embedding, indexing, graph construction, and retrieval remain downstream capabilities.
 
@@ -107,6 +111,4 @@ python -m build
 python -m twine check dist/*
 ```
 
-Versioning uses FlossWare's `X.Y` convention. Release tags are exactly `X.Y`, without a `v` prefix.
-
-The GitHub release workflow builds one immutable artifact set and publishes those same artifacts to GitHub Releases and PyPI using trusted publishing. PyPI environment approval must be configured in the repository before the first release.
+Versioning uses FlossWare's `X.Y` convention. **Builds, tests, pull requests, and merges do not require Git tags.** The package version is read from `pyproject.toml`. Any future publication workflow is independent of normal CI/build validation.
