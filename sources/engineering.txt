@@ -1,0 +1,9 @@
+# Engineering, standards, and technical reference sources
+https://www.nist.gov/
+https://www.nasa.gov/
+https://www.osti.gov/
+https://www.asme.org/
+https://www.ieee.org/
+https://www.ietf.org/
+https://www.iso.org/
+https://www.nasa.gov/reference/
