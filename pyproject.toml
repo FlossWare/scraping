@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "scraping"
+name = "flossware-scraping"
 version = "0.1"
 description = "Local-first resource acquisition and web scraping capability for FlossWare"
 readme = "README.md"
