@@ -1,4 +1,6 @@
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from urllib.request import Request
@@ -7,7 +9,7 @@ from scraping.acquisition.corpus import LocalCorpus, _SafeRedirectHandler, fetch
 from scraping.cli import main
 from scraping.discovery.filesystem import filesystem_uris
 from scraping.discovery.sitemap import sitemap_urls
-from scraping.discovery.web import RobotsPolicy, discover_links, extract_links
+from scraping.discovery.web import RobotsPolicy, crawl, discover_links, extract_links
 from scraping.uri import normalize_uri
 
 
@@ -57,6 +59,11 @@ def test_fetch_uri_rejects_unsupported_scheme():
 def test_validate_remote_uri_blocks_loopback():
     with pytest.raises(ValueError, match="private or non-public"):
         validate_remote_uri("http://127.0.0.1/")
+
+
+def test_fetch_uri_rejects_remote_credentials():
+    with pytest.raises(ValueError, match="credentials"):
+        fetch_uri("https://user:secret@example.org/", allow_private=True)
 
 
 def test_fetch_uri_enforces_size_limit(monkeypatch):
@@ -134,6 +141,20 @@ def test_discovery_returns_uris_not_bodies(monkeypatch):
     assert found == ["https://example.org/", "https://example.org/child"]
 
 
+def test_crawl_alias_forwards_limits(monkeypatch):
+    seen = {}
+
+    def fake(start, **kwargs):
+        seen.update(kwargs)
+        return [start]
+
+    monkeypatch.setattr("scraping.discovery.web.discover_links", fake)
+    crawl("https://example.org/", timeout=7, max_size=123, allow_private=True)
+    assert seen["timeout"] == 7
+    assert seen["max_size"] == 123
+    assert seen["allow_private"] is True
+
+
 def test_sitemap_is_bounded_and_rejects_doctype(monkeypatch):
     xml = b'<!DOCTYPE foo><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.org/a</loc></url></urlset>'
     monkeypatch.setattr("scraping.discovery.sitemap.fetch_uri", lambda *args, **kwargs: (xml, "application/xml"))
@@ -152,3 +173,37 @@ def test_cli_returns_nonzero_on_acquisition_error(tmp_path, capsys):
     code = main([str(tmp_path / "missing.txt"), "--output", str(tmp_path / "corpus")])
     assert code == 1
     assert "error:" in capsys.readouterr().out
+
+
+def test_cli_rejects_empty_invocation(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main([])
+    assert exc.value.code == 2
+    assert "at least one source" in capsys.readouterr().err
+
+
+def test_local_http_server_end_to_end(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"hello from local server"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        uri = f"http://127.0.0.1:{server.server_port}/resource.txt"
+        data, media_type = fetch_uri(uri, allow_private=True)
+        assert data == b"hello from local server"
+        assert media_type == "text/plain"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
