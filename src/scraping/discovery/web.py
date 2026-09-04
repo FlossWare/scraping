@@ -1,7 +1,6 @@
 from html.parser import HTMLParser
 import time
 from urllib.parse import urldefrag, urljoin, urlparse
-from urllib.request import Request, urlopen
 
 from ..acquisition.corpus import DEFAULT_MAX_SIZE, DEFAULT_USER_AGENT, fetch_uri
 
@@ -40,8 +39,9 @@ def allowed_by_host(uri: str, root: str, scope: str = "host") -> bool:
 
 
 class RobotsPolicy:
-    def __init__(self, user_agent: str = DEFAULT_USER_AGENT):
+    def __init__(self, user_agent: str = DEFAULT_USER_AGENT, *, allow_private: bool = False):
         self.user_agent = user_agent
+        self.allow_private = allow_private
         self._cache: dict[str, object] = {}
 
     def allowed(self, uri: str) -> bool:
@@ -49,19 +49,17 @@ class RobotsPolicy:
         origin = f"{parsed.scheme}://{parsed.netloc}"
         if origin not in self._cache:
             try:
-                request = Request(f"{origin}/robots.txt", headers={"User-Agent": self.user_agent})
-                with urlopen(request, timeout=10) as response:
-                    body = response.read(1_000_001)
-                    if len(body) > 1_000_000:
-                        self._cache[origin] = None
-                        return True
+                body, _ = fetch_uri(
+                    f"{origin}/robots.txt", timeout=10.0, max_size=1_000_000,
+                    user_agent=self.user_agent, allow_private=self.allow_private,
+                )
                 from urllib.robotparser import RobotFileParser
                 parser = RobotFileParser()
                 parser.set_url(f"{origin}/robots.txt")
                 parser.parse(body.decode("utf-8", errors="replace").splitlines())
                 self._cache[origin] = parser
-            except OSError:
-                # robots.txt being unavailable is not an explicit disallow rule.
+            except (OSError, ValueError):
+                # Missing, inaccessible, or oversized robots.txt is not an explicit disallow.
                 self._cache[origin] = None
         parser = self._cache[origin]
         return True if parser is None else parser.can_fetch(self.user_agent, uri)
@@ -79,17 +77,18 @@ def discover_links(
     max_size: int = DEFAULT_MAX_SIZE,
     allow_private: bool = False,
 ) -> list[str]:
-    """Discover URI identities by traversing HTML pages.
+    """Discover URI identities by bounded traversal of HTML pages.
 
-    Page bodies are fetched only transiently to inspect links. Durable acquisition
-    is performed separately by ``fetch_uri``/``LocalCorpus``.
+    Page bodies are transient traversal inputs. Durable acquisition is performed
+    separately by ``fetch_uri`` and ``LocalCorpus``.
     """
-    if depth < 0 or max_pages < 1:
-        raise ValueError("depth must be >= 0 and max_pages must be >= 1")
+    if depth < 0 or max_pages < 1 or rate_limit < 0 or timeout <= 0 or max_size < 1:
+        raise ValueError("invalid discovery limits")
     queue: list[tuple[str, int]] = [(urldefrag(start)[0], 0)]
     seen: set[str] = set()
     discovered: list[str] = []
-    robots = RobotsPolicy() if respect_robots else None
+    robots = RobotsPolicy(allow_private=allow_private) if respect_robots else None
+    last_request = 0.0
     while queue and len(discovered) < max_pages:
         uri, level = queue.pop(0)
         if uri in seen or level > depth:
@@ -99,9 +98,10 @@ def discover_links(
             continue
         if robots and not robots.allowed(uri):
             continue
-        if discovered and rate_limit > 0:
-            time.sleep(rate_limit)
+        if last_request and rate_limit > 0:
+            time.sleep(max(0.0, rate_limit - (time.monotonic() - last_request)))
         try:
+            last_request = time.monotonic()
             data, media_type = fetch_uri(uri, timeout=timeout, max_size=max_size, allow_private=allow_private)
         except (OSError, ValueError):
             continue
