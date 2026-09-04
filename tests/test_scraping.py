@@ -1,5 +1,4 @@
 import json
-from unittest.mock import patch
 
 import pytest
 
@@ -53,27 +52,32 @@ def test_fetch_uri_enforces_size_limit(monkeypatch):
     class Headers:
         def get(self, name):
             return None
+
         def get_content_type(self):
             return "text/plain"
 
     class Response:
         headers = Headers()
+
         def __enter__(self):
             return self
+
         def __exit__(self, *args):
             return False
+
         def read(self, size=-1):
             return b"x" * size
 
-    monkeypatch.setattr("scraping.acquisition.corpus.build_opener", lambda handler: type("O", (), {"open": lambda self, request, timeout: Response()})())
+    monkeypatch.setattr(
+        "scraping.acquisition.corpus.build_opener",
+        lambda handler: type("O", (), {"open": lambda self, request, timeout: Response()})(),
+    )
     with pytest.raises(ValueError, match="max size"):
         fetch_uri("https://example.org/large", max_size=10, allow_private=True)
 
 
 def test_robots_missing_allows(monkeypatch):
-    def fail(*args, **kwargs):
-        raise OSError("missing")
-    monkeypatch.setattr("scraping.discovery.web.urlopen", fail)
+    monkeypatch.setattr("scraping.discovery.web.fetch_uri", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("missing")))
     assert RobotsPolicy().allowed("https://example.org/a") is True
 
 
@@ -92,6 +96,13 @@ def test_sitemap_is_bounded_and_rejects_doctype(monkeypatch):
     monkeypatch.setattr("scraping.discovery.sitemap.fetch_uri", lambda *args, **kwargs: (xml, "application/xml"))
     with pytest.raises(ValueError, match="DOCTYPE"):
         sitemap_urls("https://example.org/sitemap.xml", allow_private=True)
+
+
+def test_sitemap_total_size_is_bounded(monkeypatch):
+    xml = b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.org/a</loc></url></urlset>'
+    monkeypatch.setattr("scraping.discovery.sitemap.fetch_uri", lambda *args, **kwargs: (xml, "application/xml"))
+    with pytest.raises(ValueError, match="total size"):
+        sitemap_urls("https://example.org/sitemap.xml", max_size=10_000, max_total_size=10, allow_private=True)
 
 
 def test_cli_returns_nonzero_on_acquisition_error(tmp_path, capsys):
