@@ -1,16 +1,22 @@
 import argparse
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .acquisition import LocalCorpus, fetch_uri
+from .acquisition.corpus import DEFAULT_MAX_SIZE
 from .discovery.filesystem import filesystem_uris
 from .discovery.sitemap import sitemap_urls
-from .discovery.web import crawl
+from .discovery.web import discover_links
 from .uri import normalize_uri
 
 
 def _read_uris(path: str) -> list[str]:
-    return [normalize_uri(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    return [
+        normalize_uri(line.strip())
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
 
 
 def main(argv=None) -> int:
@@ -23,46 +29,78 @@ def main(argv=None) -> int:
     parser.add_argument("--max-pages", type=int, default=1000)
     parser.add_argument("--scope", choices=("host", "domain"), default="host")
     parser.add_argument("--rate-limit", type=float, default=0.5, help="Seconds between web requests")
-    parser.add_argument("--max-file-size", type=int, default=50_000_000)
+    parser.add_argument("--max-file-size", type=int, default=DEFAULT_MAX_SIZE)
+    parser.add_argument("--sitemap-depth", type=int, default=3)
+    parser.add_argument("--sitemap-max-urls", type=int, default=10_000)
+    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--allow-private", action="store_true", help="Allow private/link-local remote addresses")
     parser.add_argument("--no-robots", action="store_true")
     args = parser.parse_args(argv)
 
+    if args.depth < 0 or args.max_pages < 1 or args.max_file_size < 1 or args.timeout <= 0 or args.rate_limit < 0:
+        parser.error("depth/max-pages/max-file-size must be positive where applicable; timeout > 0; rate-limit >= 0")
+
     corpus = LocalCorpus(args.output)
     targets: list[tuple[str, str]] = []
+    failures = 0
+
     for source in args.sources:
         uri = normalize_uri(source)
-        if uri.startswith("file://"):
-            path = urlparse(uri).path
-            for child in filesystem_uris(path):
-                targets.append((child, "filesystem"))
+        if uri.startswith("file://") and Path(urlparse(uri).path).is_dir():
+            targets.extend((child, "filesystem") for child in filesystem_uris(urlparse(uri).path))
         elif uri.startswith(("http://", "https://")):
-            targets.append((uri, "explicit"))
+            try:
+                discovered = discover_links(
+                    uri, depth=args.depth, max_pages=args.max_pages, rate_limit=args.rate_limit,
+                    scope=args.scope, respect_robots=not args.no_robots, timeout=args.timeout,
+                    max_size=args.max_file_size, allow_private=args.allow_private,
+                )
+                targets.extend((item, "crawl") for item in discovered)
+            except (OSError, ValueError) as exc:
+                print(f"error: {uri}: {exc}")
+                failures += 1
         else:
             targets.append((uri, "explicit"))
-    for path in args.uris:
-        targets.extend((uri, "uri-file") for uri in _read_uris(path))
-    for sitemap in args.sitemap:
-        targets.extend((uri, "sitemap") for uri in sitemap_urls(normalize_uri(sitemap)))
 
-    seen = set()
+    for path in args.uris:
+        try:
+            targets.extend((uri, "uri-file") for uri in _read_uris(path))
+        except OSError as exc:
+            print(f"error: {path}: {exc}")
+            failures += 1
+
+    for sitemap in args.sitemap:
+        try:
+            targets.extend(
+                (uri, "sitemap")
+                for uri in sitemap_urls(
+                    normalize_uri(sitemap), timeout=args.timeout, max_depth=args.sitemap_depth,
+                    max_urls=args.sitemap_max_urls, max_size=args.max_file_size, allow_private=args.allow_private,
+                )
+            )
+        except (OSError, ValueError) as exc:
+            print(f"error: {sitemap}: {exc}")
+            failures += 1
+
+    seen: set[str] = set()
     stored = 0
     for uri, discovered_by in targets:
         if uri in seen:
             continue
         seen.add(uri)
+        if uri.startswith(("http://", "https://", "ftp://")) and seen:
+            if rate := args.rate_limit:
+                time.sleep(rate)
         try:
-            if uri.startswith(("http://", "https://")) and discovered_by == "explicit":
-                results = crawl(uri, depth=args.depth, max_pages=args.max_pages, rate_limit=args.rate_limit, scope=args.scope, respect_robots=not args.no_robots)
-                for item_uri, data, media_type, method in results:
-                    if len(data) > args.max_file_size:
-                        continue
-                    if corpus.store(item_uri, data, media_type, method):
-                        stored += 1
-            else:
-                data, media_type = fetch_uri(uri, max_size=args.max_file_size)
-                if corpus.store(uri, data, media_type, discovered_by):
-                    stored += 1
+            data, media_type = fetch_uri(
+                uri, timeout=args.timeout, max_size=args.max_file_size,
+                allow_private=args.allow_private,
+            )
+            corpus.store(uri, data, media_type, discovered_by)
+            stored += 1
         except (OSError, ValueError) as exc:
             print(f"error: {uri}: {exc}")
-    print(f"stored {stored} new resource(s) in {corpus.root}")
-    return 0
+            failures += 1
+
+    print(f"stored {stored} resource(s) in {corpus.root}")
+    return 1 if failures else 0
