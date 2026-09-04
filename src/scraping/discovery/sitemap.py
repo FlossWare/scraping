@@ -11,22 +11,30 @@ def sitemap_urls(
     max_depth: int = 3,
     max_urls: int = 10_000,
     max_size: int = DEFAULT_MAX_SIZE,
+    max_total_size: int = 100_000_000,
     allow_private: bool = False,
 ) -> list[str]:
-    """Discover URLs from a sitemap or bounded sitemap index tree."""
-    if max_depth < 0 or max_urls < 1:
-        raise ValueError("max_depth must be >= 0 and max_urls must be >= 1")
+    """Discover URLs from a bounded sitemap or sitemap-index tree."""
+    if max_depth < 0 or max_urls < 1 or max_size < 1 or max_total_size < 1:
+        raise ValueError("sitemap limits must be positive and max_depth must be >= 0")
     parsed = urlparse(uri)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("sitemaps must use http:// or https://")
     seen_sitemaps: set[str] = set()
     results: list[str] = []
+    total_size = 0
 
     def visit(current: str, depth: int) -> None:
+        nonlocal total_size
         if current in seen_sitemaps or depth > max_depth or len(results) >= max_urls:
             return
         seen_sitemaps.add(current)
         data, _ = fetch_uri(current, timeout=timeout, max_size=max_size, allow_private=allow_private)
+        total_size += len(data)
+        if total_size > max_total_size:
+            raise ValueError("sitemap data exceeds configured total size")
+        if b"<!DOCTYPE" in data.upper():
+            raise ValueError("DOCTYPE is not permitted in sitemaps")
         root = ElementTree.fromstring(data)
         tag = root.tag.rsplit("}", 1)[-1]
         if tag == "sitemapindex":
