@@ -1,13 +1,54 @@
 import hashlib
 import json
+import socket
+from ipaddress import ip_address
 from pathlib import Path
-from urllib.parse import urlparse, unquote
-from urllib.request import urlopen
-from .models import AcquiredResource
+from urllib.parse import unquote, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from ..models import AcquiredResource
+
+DEFAULT_USER_AGENT = "FlossWare-scraping/0.1"
+DEFAULT_MAX_SIZE = 50_000_000
+
+
+def _blocked_address(hostname: str) -> bool:
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(hostname, None)}
+    except socket.gaierror as exc:
+        raise OSError(f"unable to resolve remote host: {hostname}") from exc
+    for address in addresses:
+        ip = ip_address(address)
+        if any((ip.is_private, ip.is_loopback, ip.is_link_local, ip.is_multicast, ip.is_unspecified, ip.is_reserved)):
+            return True
+    return False
+
+
+def validate_remote_uri(uri: str, *, allow_private: bool = False) -> None:
+    parsed = urlparse(uri)
+    if parsed.scheme not in {"http", "https", "ftp"}:
+        raise ValueError(f"unsupported remote scheme: {parsed.scheme or '<none>'}")
+    if not parsed.hostname:
+        raise ValueError("remote URI has no hostname")
+    if not allow_private and _blocked_address(parsed.hostname):
+        raise ValueError(f"refusing private or non-public remote address: {parsed.hostname}")
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, *, allow_private: bool):
+        super().__init__()
+        self.allow_private = allow_private
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlparse(newurl)
+        if parsed.scheme == "file":
+            raise ValueError("refusing redirect to file://")
+        validate_remote_uri(newurl, allow_private=self.allow_private)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class LocalCorpus:
-    """Persist raw acquisition artifacts and an append-only JSONL manifest."""
+    """Persist raw acquisition artifacts and a provenance-preserving JSONL manifest."""
 
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser().resolve()
@@ -18,16 +59,25 @@ class LocalCorpus:
         (self.root / "state").mkdir(exist_ok=True)
         self.manifest = self.root / "manifest" / "manifest.jsonl"
 
-    def store(self, uri: str, data: bytes, media_type: str, discovered_by: str) -> AcquiredResource | None:
+    def store(self, uri: str, data: bytes, media_type: str, discovered_by: str) -> AcquiredResource:
         digest = hashlib.sha256(data).hexdigest()
         existing = self.root / "raw" / digest[:2] / digest[2:4]
         suffix = self._suffix(uri, media_type)
         raw_path = existing / f"{digest}{suffix}"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
-        if raw_path.exists():
-            return None
-        raw_path.write_bytes(data)
-        record = AcquiredResource(uri, media_type, digest, str(raw_path.relative_to(self.root)), len(data), AcquiredResource.now(), discovered_by)
+        if not raw_path.exists():
+            tmp = raw_path.with_name(raw_path.name + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(raw_path)
+        record = AcquiredResource(
+            uri,
+            media_type,
+            digest,
+            str(raw_path.relative_to(self.root)),
+            len(data),
+            AcquiredResource.now(),
+            discovered_by,
+        )
         with self.manifest.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record.__dict__, sort_keys=True) + "\n")
         return record
@@ -42,28 +92,59 @@ class LocalCorpus:
 
 
 def read_file_uri(uri: str, *, max_size: int) -> tuple[bytes, str]:
-    path = Path(unquote(urlparse(uri).path))
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        raise ValueError("not a file URI")
+    path = Path(unquote(parsed.path)).resolve()
     size = path.stat().st_size
     if size > max_size:
         raise ValueError(f"resource exceeds max size: {size} > {max_size}")
-    data = path.read_bytes()
-    return data, _media_type(path.suffix)
+    return path.read_bytes(), _media_type(path.suffix)
 
 
-def fetch_uri(uri: str, *, timeout: float = 30.0, max_size: int = 50_000_000, user_agent: str = "FlossWare-scraping/0.1") -> tuple[bytes, str]:
-    if urlparse(uri).scheme == "file":
+def fetch_uri(
+    uri: str,
+    *,
+    timeout: float = 30.0,
+    max_size: int = DEFAULT_MAX_SIZE,
+    user_agent: str = DEFAULT_USER_AGENT,
+    allow_private: bool = False,
+) -> tuple[bytes, str]:
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
         return read_file_uri(uri, max_size=max_size)
-    from urllib.request import Request
+    validate_remote_uri(uri, allow_private=allow_private)
     request = Request(uri, headers={"User-Agent": user_agent, "Accept": "*/*"})
-    with urlopen(request, timeout=timeout) as response:
+    opener = build_opener(_SafeRedirectHandler(allow_private=allow_private))
+    with opener.open(request, timeout=timeout) as response:
         length = response.headers.get("Content-Length")
-        if length and int(length) > max_size:
-            raise ValueError("resource exceeds configured max size")
-        data = response.read(max_size + 1)
-        if len(data) > max_size:
-            raise ValueError("resource exceeds configured max size")
+        if length:
+            try:
+                if int(length) > max_size:
+                    raise ValueError("resource exceeds configured max size")
+            except ValueError as exc:
+                if str(exc) == "resource exceeds configured max size":
+                    raise
+        data = _read_limited(response, max_size)
         return data, response.headers.get_content_type() or "application/octet-stream"
 
 
+def _read_limited(response, max_size: int, *, chunk_size: int = 64 * 1024) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = response.read(min(chunk_size, max_size - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_size:
+            raise ValueError("resource exceeds configured max size")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _media_type(suffix: str) -> str:
-    return {".html": "text/html", ".htm": "text/html", ".pdf": "application/pdf", ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json", ".xml": "application/xml"}.get(suffix.lower(), "application/octet-stream")
+    return {
+        ".html": "text/html", ".htm": "text/html", ".pdf": "application/pdf", ".txt": "text/plain",
+        ".md": "text/markdown", ".json": "application/json", ".xml": "application/xml",
+    }.get(suffix.lower(), "application/octet-stream")
