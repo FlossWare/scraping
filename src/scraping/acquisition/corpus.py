@@ -1,7 +1,9 @@
 import hashlib
 import json
 import os
+import queue
 import socket
+import threading
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -11,39 +13,72 @@ from ..models import AcquiredResource
 
 DEFAULT_USER_AGENT = "FlossWare-scraping/0.1"
 DEFAULT_MAX_SIZE = 50_000_000
+DEFAULT_DNS_TIMEOUT = 5.0
 
 
-def _blocked_address(hostname: str) -> bool:
-    try:
-        addresses = {info[4][0] for info in socket.getaddrinfo(hostname, None)}
-    except socket.gaierror as exc:
-        raise OSError(f"unable to resolve remote host: {hostname}") from exc
+def _resolve_addresses(hostname: str, timeout: float = DEFAULT_DNS_TIMEOUT) -> set[str]:
+    result: queue.Queue[object] = queue.Queue(maxsize=1)
+
+    def resolve():
+        try:
+            result.put({info[4][0] for info in socket.getaddrinfo(hostname, None)})
+        except BaseException as exc:  # propagate resolver failure to the caller
+            result.put(exc)
+
+    thread = threading.Thread(target=resolve, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise OSError(f"DNS resolution timed out for remote host: {hostname}")
+    resolved = result.get_nowait()
+    if isinstance(resolved, BaseException):
+        if isinstance(resolved, socket.gaierror):
+            raise OSError(f"unable to resolve remote host: {hostname}") from resolved
+        raise OSError(f"unable to resolve remote host: {hostname}") from resolved
+    return resolved  # type: ignore[return-value]
+
+
+def _blocked_address(hostname: str, *, dns_timeout: float = DEFAULT_DNS_TIMEOUT) -> bool:
+    addresses = _resolve_addresses(hostname, dns_timeout)
     return any(
-        any((ip_address(address).is_private, ip_address(address).is_loopback, ip_address(address).is_link_local,
-             ip_address(address).is_multicast, ip_address(address).is_unspecified, ip_address(address).is_reserved))
+        any(
+            (
+                ip_address(address).is_private,
+                ip_address(address).is_loopback,
+                ip_address(address).is_link_local,
+                ip_address(address).is_multicast,
+                ip_address(address).is_unspecified,
+                ip_address(address).is_reserved,
+            )
+        )
         for address in addresses
     )
 
 
-def validate_remote_uri(uri: str, *, allow_private: bool = False) -> None:
+def validate_remote_uri(
+    uri: str, *, allow_private: bool = False, dns_timeout: float = DEFAULT_DNS_TIMEOUT
+) -> None:
     parsed = urlparse(uri)
     if parsed.scheme not in {"http", "https", "ftp"}:
         raise ValueError(f"unsupported remote scheme: {parsed.scheme or '<none>'}")
     if not parsed.hostname:
         raise ValueError("remote URI has no hostname")
-    if not allow_private and _blocked_address(parsed.hostname):
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("credentials in remote URIs are not supported")
+    if not allow_private and _blocked_address(parsed.hostname, dns_timeout=dns_timeout):
         raise ValueError(f"refusing private or non-public remote address: {parsed.hostname}")
 
 
 class _SafeRedirectHandler(HTTPRedirectHandler):
-    def __init__(self, *, allow_private: bool):
+    def __init__(self, *, allow_private: bool, dns_timeout: float = DEFAULT_DNS_TIMEOUT):
         super().__init__()
         self.allow_private = allow_private
+        self.dns_timeout = dns_timeout
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urlparse(newurl).scheme == "file":
             raise ValueError("refusing redirect to file://")
-        validate_remote_uri(newurl, allow_private=self.allow_private)
+        validate_remote_uri(newurl, allow_private=self.allow_private, dns_timeout=self.dns_timeout)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -111,15 +146,16 @@ def fetch_uri(
     max_size: int = DEFAULT_MAX_SIZE,
     user_agent: str = DEFAULT_USER_AGENT,
     allow_private: bool = False,
+    dns_timeout: float = DEFAULT_DNS_TIMEOUT,
 ) -> tuple[bytes, str]:
-    if timeout <= 0 or max_size < 1:
-        raise ValueError("timeout must be positive and max_size must be positive")
+    if timeout <= 0 or max_size < 1 or dns_timeout <= 0:
+        raise ValueError("timeout, max_size, and dns_timeout must be positive")
     parsed = urlparse(uri)
     if parsed.scheme == "file":
         return read_file_uri(uri, max_size=max_size)
-    validate_remote_uri(uri, allow_private=allow_private)
+    validate_remote_uri(uri, allow_private=allow_private, dns_timeout=dns_timeout)
     request = Request(uri, headers={"User-Agent": user_agent, "Accept": "*/*"})
-    opener = build_opener(_SafeRedirectHandler(allow_private=allow_private))
+    opener = build_opener(_SafeRedirectHandler(allow_private=allow_private, dns_timeout=dns_timeout))
     with opener.open(request, timeout=timeout) as response:
         length = response.headers.get("Content-Length")
         if length:
