@@ -1,9 +1,19 @@
 import json
+from unittest.mock import patch
 
-from scraping.acquisition.corpus import LocalCorpus
+import pytest
+
+from scraping.acquisition.corpus import LocalCorpus, fetch_uri
+from scraping.cli import main
 from scraping.discovery.filesystem import filesystem_uris
-from scraping.discovery.web import extract_links
+from scraping.discovery.sitemap import sitemap_urls
+from scraping.discovery.web import RobotsPolicy, discover_links, extract_links
 from scraping.uri import normalize_uri
+
+
+def test_package_import_smoke():
+    import scraping
+    assert scraping.AcquiredResource is not None
 
 
 def test_normalize_path_to_file_uri(tmp_path):
@@ -24,8 +34,67 @@ def test_filesystem_discovery(tmp_path):
 def test_corpus_stores_raw_and_manifest(tmp_path):
     corpus = LocalCorpus(tmp_path / "corpus")
     record = corpus.store("file:///tmp/a.txt", b"hello", "text/plain", "filesystem")
+    duplicate = corpus.store("file:///tmp/b.txt", b"hello", "text/plain", "filesystem")
     assert record is not None
+    assert duplicate is not None
+    assert record.content_hash == duplicate.content_hash
     assert (corpus.root / record.raw_path).exists()
     rows = corpus.manifest.read_text(encoding="utf-8").splitlines()
-    assert json.loads(rows[0])["content_hash"] == record.content_hash
-    assert (tmp_path / "corpus" / "extracted").is_dir()
+    assert len(rows) == 2
+    assert json.loads(rows[1])["uri"] == "file:///tmp/b.txt"
+
+
+def test_fetch_uri_rejects_unsupported_scheme():
+    with pytest.raises(ValueError, match="unsupported remote scheme"):
+        fetch_uri("gopher://example.org/")
+
+
+def test_fetch_uri_enforces_size_limit(monkeypatch):
+    class Headers:
+        def get(self, name):
+            return None
+        def get_content_type(self):
+            return "text/plain"
+
+    class Response:
+        headers = Headers()
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, size=-1):
+            return b"x" * size
+
+    monkeypatch.setattr("scraping.acquisition.corpus.build_opener", lambda handler: type("O", (), {"open": lambda self, request, timeout: Response()})())
+    with pytest.raises(ValueError, match="max size"):
+        fetch_uri("https://example.org/large", max_size=10, allow_private=True)
+
+
+def test_robots_missing_allows(monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("missing")
+    monkeypatch.setattr("scraping.discovery.web.urlopen", fail)
+    assert RobotsPolicy().allowed("https://example.org/a") is True
+
+
+def test_discovery_returns_uris_not_bodies(monkeypatch):
+    pages = {
+        "https://example.org/": (b'<a href="/child">child</a>', "text/html"),
+        "https://example.org/child": (b"child", "text/plain"),
+    }
+    monkeypatch.setattr("scraping.discovery.web.fetch_uri", lambda uri, **kwargs: pages[uri])
+    found = discover_links("https://example.org/", depth=1, max_pages=10, rate_limit=0, scope="host", respect_robots=False, allow_private=True)
+    assert found == ["https://example.org/", "https://example.org/child"]
+
+
+def test_sitemap_is_bounded_and_rejects_doctype(monkeypatch):
+    xml = b'<!DOCTYPE foo><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.org/a</loc></url></urlset>'
+    monkeypatch.setattr("scraping.discovery.sitemap.fetch_uri", lambda *args, **kwargs: (xml, "application/xml"))
+    with pytest.raises(ValueError, match="DOCTYPE"):
+        sitemap_urls("https://example.org/sitemap.xml", allow_private=True)
+
+
+def test_cli_returns_nonzero_on_acquisition_error(tmp_path, capsys):
+    code = main([str(tmp_path / "missing.txt"), "--output", str(tmp_path / "corpus")])
+    assert code == 1
+    assert "error:" in capsys.readouterr().out
