@@ -1,4 +1,5 @@
 import argparse
+import json
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -8,6 +9,7 @@ from .acquisition.corpus import DEFAULT_MAX_SIZE
 from .discovery.filesystem import filesystem_uris
 from .discovery.sitemap import sitemap_urls
 from .discovery.web import discover_links
+from .legacy_inventory import inventory_corpus
 from .uri import normalize_uri
 
 
@@ -19,7 +21,31 @@ def _read_uris(path: str) -> list[str]:
     ]
 
 
+def _legacy_inventory_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scrape legacy-inventory",
+        description="Inventory a historical scraped corpus without modifying it.",
+    )
+    parser.add_argument("root", help="Historical corpus directory")
+    parser.add_argument("--output", required=True, help="JSON report path")
+    args = parser.parse_args(argv)
+    try:
+        report = inventory_corpus(args.root)
+        output = Path(args.output).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+    print(f"inventoried {report['corpus']['files']} file(s) in {report['corpus']['path']}")
+    print(f"report: {output}")
+    return 0
+
+
 def main(argv=None) -> int:
+    argv = list(argv) if argv is not None else None
+    if argv and argv[0] == "legacy-inventory":
+        return _legacy_inventory_main(argv[1:])
     parser = argparse.ArgumentParser(prog="scrape", description="Acquire web and filesystem resources into a local corpus.")
     parser.add_argument("sources", nargs="*", help="URLs or filesystem paths")
     parser.add_argument("--uris", action="append", default=[], help="Text file containing one URI/path per line")
