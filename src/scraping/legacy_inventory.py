@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""Read-only inventory of a historical scraped corpus.
+
+This file is intentionally standalone: it uses only the Python standard library
+so it can be downloaded and run directly on a corpus host.
+"""
+
+import argparse
 import hashlib
 import json
 import os
@@ -180,3 +188,33 @@ def write_inventory(root: str | Path, output: str | Path) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Inventory a historical scraped corpus without modifying it."
+    )
+    parser.add_argument("root", help="Root directory of the historical corpus")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="legacy-inventory.json",
+        help="JSON report path (default: legacy-inventory.json)",
+    )
+    args = parser.parse_args()
+
+    try:
+        report = write_inventory(args.root, args.output)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    print(f"Inventory complete: {report['corpus']['files']:,} files")
+    print(f"JSON: {report['file_types'].get('json', 0):,}")
+    print(f"PDF: {report['file_types'].get('pdf', 0):,}")
+    print(f"Other: {report['file_types'].get('other', 0):,}")
+    print(f"Report: {Path(args.output).expanduser().resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
