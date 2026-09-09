@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -43,7 +44,7 @@ def _legacy_inventory_main(argv: list[str]) -> int:
 
 
 def main(argv=None) -> int:
-    argv = list(argv) if argv is not None else None
+    argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "legacy-inventory":
         return _legacy_inventory_main(argv[1:])
     parser = argparse.ArgumentParser(prog="scrape", description="Acquire web and filesystem resources into a local corpus.")
